@@ -1,9 +1,12 @@
 import asyncio
 import logging
 import time
+import os
+
 from fastapi import FastAPI
 import inngest
 import inngest.fast_api
+import httpx
 
 
 # ----------------------------
@@ -18,6 +21,33 @@ app = FastAPI()
 
 
 # ============================================================
+# 0) TRIGGER AWS SAM JOB (Inngest -> AWS API Gateway -> Starter Lambda)
+# ============================================================
+AWS_START_URL = os.environ.get(
+    "AWS_START_URL",
+    "https://64ikrf53rg.execute-api.eu-north-1.amazonaws.com/Prod/start",
+)
+
+@inngest_client.create_function(
+    fn_id="trigger_aws_sam_job",
+    trigger=inngest.TriggerEvent(event="demo/trigger_aws_sam_job"),
+    retries=0,
+)
+async def trigger_aws_sam_job(ctx: inngest.Context):
+    ctx.logger.info(f"Triggering AWS Starter API: {AWS_START_URL}")
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(AWS_START_URL)
+
+    ctx.logger.info(f"AWS response: {r.status_code} {r.text}")
+
+    if r.status_code >= 400:
+        raise Exception(f"AWS Starter failed: {r.status_code} {r.text}")
+
+    return {"status_code": r.status_code, "body": r.text}
+
+
+# ============================================================
 # 1) BAD FUNCTION (single long run)
 # Simulates Lambda timeout issue
 # Runs once only (no retries)
@@ -25,7 +55,7 @@ app = FastAPI()
 @inngest_client.create_function(
     fn_id="bad_long_job",
     trigger=inngest.TriggerEvent(event="demo/bad_long_job"),
-    retries=0,  # ✅ important: fail once and stop
+    retries=0,
 )
 async def bad_long_job(ctx: inngest.Context) -> str:
     ctx.logger.info("Starting BAD long job...")
@@ -40,7 +70,6 @@ async def bad_long_job(ctx: inngest.Context) -> str:
         if i % 25 == 0:
             ctx.logger.info(f"BAD job progress: {i}/{total}")
 
-        # Simulate Lambda timeout killing the function
         if time.time() - start_time > fake_lambda_timeout:
             raise Exception("❌ Simulated Lambda timeout (15 min limit demo)")
 
@@ -49,8 +78,7 @@ async def bad_long_job(ctx: inngest.Context) -> str:
 
 
 # ============================================================
-# 2) START JOB FUNCTION (creates chunks)
-# This finishes quickly and creates many chunk events
+# 2) START JOB FUNCTION (creates chunks locally using Inngest events)
 # ============================================================
 @inngest_client.create_function(
     fn_id="start_job",
@@ -65,7 +93,6 @@ async def start_job(ctx: inngest.Context) -> str:
     for start in range(0, total, chunk_size):
         end = min(start + chunk_size, total)
 
-        # ✅ Correct way to publish events in your SDK version
         await inngest_client.send(
             inngest.Event(
                 name="demo/process_chunk",
@@ -80,8 +107,7 @@ async def start_job(ctx: inngest.Context) -> str:
 
 
 # ============================================================
-# 3) WORKER FUNCTION (processes 1 chunk)
-# Each chunk is a separate run -> solves Lambda 15 min issue
+# 3) WORKER FUNCTION (processes 1 chunk locally)
 # ============================================================
 @inngest_client.create_function(
     fn_id="process_chunk",
@@ -93,7 +119,6 @@ async def process_chunk(ctx: inngest.Context) -> str:
 
     ctx.logger.info(f"Processing chunk {start} -> {end}")
 
-    # Simulate work (DB/API/file processing)
     for i in range(start, end):
         await asyncio.sleep(0.2)
 
@@ -107,5 +132,5 @@ async def process_chunk(ctx: inngest.Context) -> str:
 inngest.fast_api.serve(
     app,
     inngest_client,
-    [bad_long_job, start_job, process_chunk],
+    [trigger_aws_sam_job, bad_long_job, start_job, process_chunk],
 )
