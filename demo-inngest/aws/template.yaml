@@ -1,0 +1,90 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Lambda timeout chunking demo (Starter -> SQS -> Worker)
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 30
+    MemorySize: 256
+    Architectures:
+      - x86_64
+    LoggingConfig:
+      LogFormat: JSON
+
+Resources:
+  # ---------------------------
+  # Dead Letter Queue
+  # ---------------------------
+  ChunkQueueDLQ:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-chunk-dlq"
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  # ---------------------------
+  # Main Queue
+  # ---------------------------
+  ChunkQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-chunk-queue"
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 345600 # 4 days
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ChunkQueueDLQ.Arn
+        maxReceiveCount: 3
+
+  # ---------------------------
+  # Starter Lambda
+  # ---------------------------
+  StarterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-starter"
+      CodeUri: starter/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref ChunkQueue
+          TOTAL_ITEMS: "500"
+          CHUNK_SIZE: "50"
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ChunkQueue.QueueName
+      Events:
+        StartJobApi:
+          Type: Api
+          Properties:
+            Path: /start
+            Method: POST
+
+  # ---------------------------
+  # Worker Lambda
+  # ---------------------------
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-worker"
+      CodeUri: worker/
+      Handler: app.lambda_handler
+      Timeout: 60
+      MemorySize: 256
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt ChunkQueue.QueueName
+      Events:
+        ChunkQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ChunkQueue.Arn
+            BatchSize: 1
+
+Outputs:
+  StartJobApiUrl:
+    Description: API endpoint to start the job
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/start"
